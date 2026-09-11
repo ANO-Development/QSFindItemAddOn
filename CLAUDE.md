@@ -4,16 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Bukkit/Paper plugin that adds a `/finditem` command for searching items across all QuickShop-Hikari shops on a Minecraft server. Also exposes `/finditemadmin` (alias `/fiadmin`) for reload/debug. Java 21, built with Maven, shaded into a single jar. Paper 1.20+ API, with Folia support via FoliaLib.
+Bukkit/Paper plugin that adds a `/finditem` command for searching items across all QuickShop-Hikari shops on a Minecraft server. Also exposes `/finditemadmin` (alias `/fiadmin`) for reload/debug. Java 25, built with Maven, shaded into a single jar. Paper 1.20+ API, with Folia support via FoliaLib.
 
 ## Build & Run
 
 - Build: `mvn clean package` — produces the shaded jar in `target/`.
 - There are **no unit tests** in this repository; `mvn test` is a no-op. Verification is done by dropping the jar into a Paper/Folia server with QuickShop-Hikari installed.
 - `maven-shade-plugin` relocates `com.tcoded.folialib` → `io.myzticbean.finditemaddon.shaded.folialib` and `org.bstats` → `...shaded.metrics`. Never reference unshaded packages in new code.
-- `pom.xml` has commented-out `<outputDirectory>` entries in `maven-jar-plugin` intended to auto-copy the jar into a local test server's `plugins/` folder — uncomment the relevant one for your OS when iterating locally.
+- `pom.xml` has commented-out `<outputDirectory>` entries in `maven-jar-plugin` intended to auto-copy the jar into a local test server's `plugins/` folder — uncomment the relevant one for your OS when iterating locally, but **never commit it uncommented**; both `.github/workflows/*.yml` fail the build immediately if it's active (a real incident: this shipped active once and broke CI by placing the jar outside `target/`).
 - One system-scope dependency lives in `lib/Residence5.1.5.1.jar` (not on any Maven repo) — keep that file in place.
-- Version in `pom.xml` and the snapshot build date are edited manually; `plugin.yml` picks up `${project.version}` via resource filtering.
+- `pom.xml`'s `<version>` is a clean channel version with no build-specific suffix (e.g. `2.0.8.1-SNAPSHOT` or `2.0.8.1-RELEASE`) — bump it by hand only when starting new work or cutting a release. Never hand-append a date or build number to it; `plugin.yml` picks up `${project.version}` via resource filtering.
+- `CHANGELOG.md` is the single source of truth for release notes: each version's section starts with a `## ` heading, and whatever comes after the first `## ` heading up to the next one is used verbatim as both the GitHub release body and the Modrinth changelog. Keep it current before publishing — there's no separate changelog input anywhere in the release workflow (a manual `workflow_dispatch` text box was tried and dropped: GitHub's dispatch UI renders `string` inputs as single-line fields that silently flatten pasted multi-line markdown).
+- The `.github/workflows/publish-release.yml` workflow (manual `workflow_dispatch`, input: `release_type` snapshot/release) is 3 jobs: `build` computes the actual build version ephemerally via `mvn versions:set` (snapshots get `-${{ github.run_number }}` appended, releases use the pom version as-is), extracts the changelog section described above, and uploads the jar as an artifact; `github-release` and `modrinth-publish` both `needs: build`, run in parallel, and each download that same artifact — one cuts the GitHub release via `softprops/action-gh-release` (tag/name/body/asset all passed explicitly), the other publishes to Modrinth (project `asp13ugE`) via `Kir-Antipov/mc-publish`, both using the exact version string and changelog computed in `build`. This guarantees the installed jar's version always matches what's published, which is what `UpdateChecker` compares against. `release_type: snapshot` is only allowed when run from a `snapshot/**` branch (enforced in `build`'s "Compute build version" step). Do not reintroduce `Fulminazzo/java-automatic-release` for the GitHub release step — its version-detection regex (`[0-9.]+(-SNAPSHOT)?`) silently truncates our `-<run_number>` suffix, which caused a real release failure.
 
 ## Architecture
 
@@ -44,10 +46,26 @@ Each lives in `dependencies/` as a static setup-and-check class: `PlayerWarpsPlu
 - Any call that touches a shop's block / chunk / location on Folia must be wrapped in the scheduler's region task.
 
 ### Config
-`config/ConfigSetup` handles file creation, missing-key backfill, and writing out `sample-config.yml`. `config/ConfigProvider` is the typed accessor used throughout the code (`FindItemAddOn.getConfigProvider().SOME_KEY`). When adding a config option: add the field + parse logic in `ConfigProvider`, add the default to `resources/config.yml`, and update `ConfigSetup.checkForMissingProperties()` so existing installs get the new key.
+`config/ConfigSetup` handles file creation, missing-key backfill, and writing out `sample-config.yml`. `config/ConfigProvider` is the typed accessor used throughout the code (`FindItemAddOn.getConfigProvider().SOME_KEY`). When adding a config option: add the field + parse logic in `ConfigProvider`, add the default to `resources/config.yml`, update `ConfigSetup.checkForMissingProperties()` so existing installs get the new key, and **increment `config-version`** (currently 21) in the default config.
 
-## Conventions (from .windsurfrules)
+### Permissions
+All permission nodes are declared in `models/enums/PlayerPermsEnum`. Use `PlayerPermsEnum.PERMISSION_NAME.getPermission()` for checks — never hardcode permission strings. The nodes are: `finditem.use`, `finditem.hideshop`, `finditem.reload`, `finditem.admin`, `finditem.shoptp`, `finditem.shoptp.own`, `finditem.shoptp-delay.bypass`, `finditem.shoptp.bypass-safetycheck`.
+
+### Shop cache sync
+`handlers/events/ShopCreateEventListener` and `ShopDeleteEventListener` keep the in-memory shop list in sync when shops are created or removed at runtime. Any feature that modifies the cached shop list must go through these listeners, not inline in command handlers.
+
+### Enums
+`models/enums/` holds cross-cutting enums: `PlayerPermsEnum` (permissions), `ShopLorePlaceholdersEnum` (GUI lore placeholders like `{ITEM_PRICE}`, `{SHOP_OWNER}`, `{NEAREST_WARP}`), `CustomCmdPlaceholdersEnum` (placeholders for custom TP commands), and `NearestWarpModeEnum`.
+
+### GriefPrevention
+GriefPrevention is a Maven dependency but is **not** listed in `plugin.yml`'s `softdepend`. Its integration is handled in utils (not in `dependencies/`), making it the odd one out — do not follow the `dependencies/` pattern for it.
+
+### MenuListener threading
+As of v2.0.8.0, `MenuListener` handles `InventoryClickEvent` asynchronously. Any GUI click logic that touches Bukkit APIs must be dispatched back to the main/region thread via `FindItemAddOn.getScheduler()`.
+
+## Conventions
 
 - PascalCase classes, camelCase methods/variables, ALL_CAPS constants.
 - Lombok is available and used (`@Getter`, `@Slf4j`) — prefer it over hand-written boilerplate.
 - Logging goes through `utils/log/Logger` (`logInfo`, `logWarning`, `logError`), not `System.out` or raw `getLogger()`.
+- Permissions checks always use `PlayerPermsEnum`, never hardcoded strings.

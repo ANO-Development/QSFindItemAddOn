@@ -16,30 +16,20 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-package io.myzticbean.finditemaddon.utils;
+package io.myzticbean.finditemaddon.listeners;
 
 import io.myzticbean.finditemaddon.FindItemAddOn;
-import lombok.experimental.UtilityClass;
-import org.bukkit.Location;
-import org.bukkit.entity.HumanEntity;
-import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerQuitEvent;
 
 /**
- * Static facade over {@link io.myzticbean.finditemaddon.utils.platform.PlatformBridge}.
- * Call sites remain unchanged; all Bukkit logic lives in BukkitPlatformBridge.
+ * @author myzticbean
  */
-@UtilityClass
-public class PlayerUtil {
+public class PlayerQuitEventListener implements Listener {
 
-    public void sendMessage(HumanEntity player, String message) {
-        FindItemAddOn.getPlatformBridge().sendMessage(player, message);
-    }
-
-    public void teleport(Player player, Location locToTeleport) {
-        FindItemAddOn.getPlatformBridge().teleport(player, locToTeleport);
-    }
-
-    public boolean hasPermission(Player player, String permission) {
-        return FindItemAddOn.getPlatformBridge().hasPermission(player, permission);
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        FindItemAddOn.removePlayerMenuUtility(event.getPlayer());
     }
 }

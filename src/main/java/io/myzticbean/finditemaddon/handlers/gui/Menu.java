@@ -45,6 +45,8 @@ import java.util.regex.Pattern;
 @SuppressWarnings({"java:S100", "java:S3776"})
 public abstract class Menu implements InventoryHolder {
 
+    private static final Pattern MC_VERSION_PATTERN = Pattern.compile("\\(MC: ([\\d.]+)\\)");
+
     protected Inventory inventory;
 
     protected PlayerMenuUtility playerMenuUtility;
@@ -54,15 +56,18 @@ public abstract class Menu implements InventoryHolder {
     protected Menu(PlayerMenuUtility playerMenuUtility) {
         this.playerMenuUtility = playerMenuUtility;
 
-        assert FindItemAddOn.getConfigProvider().SHOP_GUI_FILLER_ITEM != null;
-        Material fillerMaterial = Material.getMaterial(FindItemAddOn.getConfigProvider().SHOP_GUI_FILLER_ITEM);
+        String fillerItemConfig = FindItemAddOn.getConfigProvider().SHOP_GUI_FILLER_ITEM;
+        Material fillerMaterial = (fillerItemConfig != null) ? Material.getMaterial(fillerItemConfig) : null;
         if (fillerMaterial == null) {
             fillerMaterial = Material.GRAY_STAINED_GLASS_PANE;
         }
         if (!fillerMaterial.isAir()) {
             GUI_FILLER_ITEM = new ItemStack(fillerMaterial);
             ItemMeta fillerItemItemMeta = this.GUI_FILLER_ITEM.getItemMeta();
-            assert fillerItemItemMeta != null;
+            if (fillerItemItemMeta == null) {
+                fillerItemItemMeta = Bukkit.getItemFactory().getItemMeta(fillerMaterial);
+            }
+            if (fillerItemItemMeta == null) return;
             fillerItemItemMeta.setDisplayName(" ");
             if(!StringUtils.isEmpty(FindItemAddOn.getConfigProvider().SHOP_GUI_FILLER_ITEM_CMD)) {
                 try {
@@ -84,8 +89,7 @@ public abstract class Menu implements InventoryHolder {
         String serverVersionString = Bukkit.getVersion();
         // Example: "1.21-109-5a5035b (MC: 1.21)" or "git-Paper-123 (MC: 1.20.4)"
         Logger.logDebugInfo("Full Server Version for check: " + serverVersionString);
-        Pattern pattern = Pattern.compile("\\(MC: ([\\d\\.]+)\\)");
-        Matcher matcher = pattern.matcher(serverVersionString);
+        Matcher matcher = MC_VERSION_PATTERN.matcher(serverVersionString);
         if (matcher.find()) {
             String mcVersionStr = matcher.group(1); // This will be "1.21" or "1.20.4" etc.
             Logger.logDebugInfo("Extracted MC Version: " + mcVersionStr);

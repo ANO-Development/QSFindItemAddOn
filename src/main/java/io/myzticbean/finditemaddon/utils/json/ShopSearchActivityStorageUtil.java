@@ -34,7 +34,7 @@ import org.bukkit.OfflinePlayer;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
-import javax.annotation.Nullable;
+import org.jetbrains.annotations.Nullable;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
@@ -112,6 +112,7 @@ public class ShopSearchActivityStorageUtil {
      * QuickShop Reremake
      * @param shop
      */
+    @Deprecated
     public void addShop(org.maxgamer.quickshop.api.shop.Shop shop) {
         for(ShopSearchActivityModel shop_i : globalShopsList) {
             if(shop_i.getX() == shop.getLocation().getX()
@@ -143,12 +144,12 @@ public class ShopSearchActivityStorageUtil {
      */
     public static void addShop(com.ghostchu.quickshop.api.shop.Shop shop) {
         ShopSearchActivityModel shopModel = new ShopSearchActivityModel(
-                shop.getLocation().getWorld().getName(),
-                shop.getLocation().getX(),
-                shop.getLocation().getY(),
-                shop.getLocation().getZ(),
-                shop.getLocation().getPitch(),
-                shop.getLocation().getYaw(),
+                shop.bukkitLocation().getWorld().getName(),
+                shop.bukkitLocation().getX(),
+                shop.bukkitLocation().getY(),
+                shop.bukkitLocation().getZ(),
+                shop.bukkitLocation().getPitch(),
+                shop.bukkitLocation().getYaw(),
                 shop.getOwner().toString(),
                 new ArrayList<>(),
                 false
@@ -162,10 +163,10 @@ public class ShopSearchActivityStorageUtil {
      */
     public static void removeShop(com.ghostchu.quickshop.api.shop.Shop shop) {
         globalShopsList.removeIf(shopSearchActivity -> shopSearchActivity.compareWith(
-                shop.getLocation().getWorld().getName(),
-                shop.getLocation().getX(),
-                shop.getLocation().getY(),
-                shop.getLocation().getZ()
+                shop.bukkitLocation().getWorld().getName(),
+                shop.bukkitLocation().getX(),
+                shop.bukkitLocation().getY(),
+                shop.bukkitLocation().getZ()
         ));
     }
 
@@ -190,7 +191,7 @@ public class ShopSearchActivityStorageUtil {
                 Logger.logError("Failed to load shops from file", e);
             }
         }
-        globalShopsList = FindItemAddOn.getQsApiInstance().syncShopsListForStorage(globalShopsList);
+        syncShops();
     }
 
     public static void saveShopsToFile() {
@@ -287,6 +288,7 @@ public class ShopSearchActivityStorageUtil {
     }
 
     @Nullable
+    @Deprecated
     public static OfflinePlayer getShopOwner(@NotNull Location shopLocation) {
         for(ShopSearchActivityModel shopSearchActivity : globalShopsList) {
             if (shopSearchActivity.compareWith(
@@ -303,9 +305,7 @@ public class ShopSearchActivityStorageUtil {
 
     @Nullable
     public static UUID getShopOwnerUUID(@NotNull Location shopLocation) {
-        Iterator<ShopSearchActivityModel> globalShopsListIterator = globalShopsList.iterator();
-        while(globalShopsListIterator.hasNext()) {
-            ShopSearchActivityModel shopSearchActivity = globalShopsListIterator.next();
+        for (ShopSearchActivityModel shopSearchActivity : globalShopsList) {
             if (shopSearchActivity.compareWith(
                     shopLocation.getWorld().getName(),
                     shopLocation.getX(),
@@ -315,8 +315,8 @@ public class ShopSearchActivityStorageUtil {
                 String uuidStr = shopSearchActivity.getShopOwnerUUID();
                 try {
                     return UUID.fromString(uuidStr);
-                } catch (IllegalArgumentException e) {
-                    if(!FindItemAddOn.isQSReremakeInstalled()) {
+                } catch (IllegalArgumentException _) {
+                    if (!FindItemAddOn.isQSReremakeInstalled()) {
                         UUID uuid = FindItemAddOn.getQsApiInstance().convertNameToUuid(uuidStr);
                         int index = globalShopsList.indexOf(shopSearchActivity);
                         globalShopsList.get(index).setShopOwnerUUID(uuid.toString());
