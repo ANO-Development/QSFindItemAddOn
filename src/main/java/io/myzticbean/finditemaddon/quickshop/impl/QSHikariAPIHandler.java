@@ -50,13 +50,19 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Predicate;
 
 /**
  * Implementation of QSApi for Hikari
@@ -65,6 +71,10 @@ import java.util.concurrent.ConcurrentMap;
 public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
 
     private static final int SHOP_CACHE_TIMEOUT_SECONDS = 5*60;
+    private static final int PERMISSION_CHECK_TIMEOUT_SECONDS = 5;
+    private static final int CHUNK_LOAD_TIMEOUT_SECONDS = 5;
+    /** Shared timeout for the stock/space reads in {@link #resolveStockOrSpaceAsync}. */
+    private static final int STOCK_READ_TIMEOUT_SECONDS = 5;
     private final QuickShopAPI api;
     private final String pluginVersion;
     private final ConcurrentMap<Long, CachedShop> shopCache;
@@ -79,123 +89,108 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
     }
 
     public CompletableFuture<List<FoundShopItemModel>> findItemBasedOnTypeFromAllShops(ItemStack item, boolean toBuy, Player searchingPlayer) {
-        var begin = Instant.now();
-        return VirtualThreadScheduler.supplyAsync(() -> {
-            List<FoundShopItemModel> shopsFoundList = new ArrayList<>();
-            List<Shop> allShops = fetchAllShopsFromQS();
-            Logger.logDebugInfo(QS_TOTAL_SHOPS_ON_SERVER + allShops.size());
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            for (Shop shopIterator : allShops) {
-                CompletableFuture<Void> processingFuture = permissionCheckFuture(searchingPlayer, shopIterator)
-                        .thenAcceptAsync(isAuthorized -> {
-                            if (isAuthorized.equals(Boolean.TRUE)
-                                    // check for blacklisted worlds
-                                    && (!FindItemAddOn.getConfigProvider().getBlacklistedWorlds().contains(shopIterator.getLocation().getWorld())
-                                    && shopIterator.getItem().getType().equals(item.getType())
-                                    && (toBuy ? shopIterator.isSelling() : shopIterator.isBuying()))
-                                    // check for shop if hidden
-                                    && (!HiddenShopStorageUtil.isShopHidden(shopIterator))) {
-                                processPotentialShopMatchAndAddToFoundList(toBuy, shopIterator, shopsFoundList, searchingPlayer);
-                            }
-                });
-                futures.add(processingFuture);
-            }
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            List<FoundShopItemModel> sortedShops = handleShopSorting(toBuy, shopsFoundList);
-            QSApi.logTimeTookMsg(begin);
-            return sortedShops;
-        });
+        return searchShops(
+            shop -> shop.getItem().getType().equals(item.getType()) && (toBuy ? shop.isSelling() : shop.isBuying()),
+            toBuy, searchingPlayer);
     }
 
     public CompletableFuture<List<FoundShopItemModel>> findItemBasedOnDisplayNameFromAllShops(String displayName, boolean toBuy, Player searchingPlayer) {
-        var begin = Instant.now();
-        return VirtualThreadScheduler.supplyAsync(() -> {
-            List<FoundShopItemModel> shopsFoundList = new ArrayList<>();
-            List<Shop> allShops = fetchAllShopsFromQS();
-            Logger.logDebugInfo(QS_TOTAL_SHOPS_ON_SERVER + allShops.size());
-
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-            for (Shop shopIterator : allShops) {
-                CompletableFuture<Void> processingFuture = permissionCheckFuture(searchingPlayer, shopIterator)
-                        .thenAcceptAsync(isAuthorized -> {
-                            if (isAuthorized.equals(Boolean.TRUE)
-                                    // check for blacklisted worlds
-                                    && !FindItemAddOn.getConfigProvider().getBlacklistedWorlds().contains(shopIterator.getLocation().getWorld())
-                                    // match the item based on query
-                                    && shopIterator.getItem().hasItemMeta()
-                                    && Objects.requireNonNull(shopIterator.getItem().getItemMeta()).hasDisplayName()
-                                    && (shopIterator.getItem().getItemMeta().getDisplayName().toLowerCase().contains(displayName.toLowerCase())
-                                    && (toBuy ? shopIterator.isSelling() : shopIterator.isBuying()))
-                                    // check for shop if hidden
-                                    && !HiddenShopStorageUtil.isShopHidden(shopIterator)) {
-                                processPotentialShopMatchAndAddToFoundList(toBuy, shopIterator, shopsFoundList, searchingPlayer);
-                            }
-                });
-                futures.add(processingFuture);
-            }
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            List<FoundShopItemModel> sortedShops = handleShopSorting(toBuy, shopsFoundList);
-            QSApi.logTimeTookMsg(begin);
-            return sortedShops;
-        });
+        return searchShops(
+            shop -> shop.getItem().hasItemMeta()
+                && Objects.requireNonNull(shop.getItem().getItemMeta()).hasDisplayName()
+                && shop.getItem().getItemMeta().getDisplayName().toLowerCase().contains(displayName.toLowerCase())
+                && (toBuy ? shop.isSelling() : shop.isBuying()),
+            toBuy, searchingPlayer);
     }
 
     public CompletableFuture<List<FoundShopItemModel>> fetchAllItemsFromAllShops(boolean toBuy, Player searchingPlayer) {
+        return searchShops(
+            shop -> toBuy ? shop.isSelling() : shop.isBuying(),
+            toBuy, searchingPlayer);
+    }
+
+    private CompletableFuture<List<FoundShopItemModel>> searchShops(Predicate<Shop> itemFilter, boolean toBuy, Player searchingPlayer) {
         var begin = Instant.now();
         return VirtualThreadScheduler.supplyAsync(() -> {
-            List<FoundShopItemModel> shopsFoundList = new ArrayList<>();
+            List<FoundShopItemModel> shopsFoundList = new CopyOnWriteArrayList<>();
             List<Shop> allShops = fetchAllShopsFromQS();
             Logger.logDebugInfo(QS_TOTAL_SHOPS_ON_SERVER + allShops.size());
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             for (Shop shopIterator : allShops) {
-                CompletableFuture<Void> processingFuture = permissionCheckFuture(searchingPlayer, shopIterator)
-                        .thenAcceptAsync(isAuthorized -> {
-                            if (isAuthorized.equals(Boolean.TRUE)
-                                    // check for blacklisted worlds
-                                    && (!FindItemAddOn.getConfigProvider().getBlacklistedWorlds().contains(shopIterator.getLocation().getWorld())
-                                    && (toBuy ? shopIterator.isSelling() : shopIterator.isBuying()))
-                                    // check for shop if hidden
-                                    && (!HiddenShopStorageUtil.isShopHidden(shopIterator))) {
-                                processPotentialShopMatchAndAddToFoundList(toBuy, shopIterator, shopsFoundList, searchingPlayer);
-                            }
-                });
-                futures.add(processingFuture);
+                futures.add(processShopMatchFuture(itemFilter, toBuy, shopIterator, shopsFoundList, searchingPlayer));
             }
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            List<FoundShopItemModel> sortedShops = new ArrayList<>(shopsFoundList);
-            if(!shopsFoundList.isEmpty()) {
-                int sortingMethod = 1;
-                sortedShops = QSApi.sortShops(sortingMethod, shopsFoundList, toBuy);
-            }
+            List<FoundShopItemModel> sortedShops = handleShopSorting(toBuy, shopsFoundList);
             QSApi.logTimeTookMsg(begin);
             return sortedShops;
         });
     }
 
     /**
-     * Asynchronously checks if a player has permission to search a specific shop.
-     * The permission check is performed on the main server thread to ensure thread safety.
-     *
-     * @param searchingPlayer The player whose permissions are being checked
-     * @param shopIterator The shop to check permissions against
-     * @return A CompletableFuture that will complete with:
-     *         - {@code true} if the player has permission to search the shop
-     *         - {@code false} if the player doesn't have permission
-     *         - Completes exceptionally if an error occurs during permission check
-     * @see BuiltInShopPermission#SEARCH
-     * @since 1.0.0
+     * Checks permission and evaluates the item filter/match for a single shop on the entity's
+     * region thread (via the Folia-safe scheduler), since {@code itemFilter}, the BentoBox lock
+     * check, and {@code Shop#getItem()} touch Bukkit/QuickShop APIs (shop item, meta, location -
+     * {@code getItem()} fires a {@code ShopItemEvent} internally) that are not safe to call
+     * off-thread ({@link BuiltInShopPermission#SEARCH}). The matched item is captured here, on the
+     * main thread, so the async phase below never has to call {@code getItem()} again.
+     * <p>
+     * If matched, stock/space is then read and the shop is added to the list on a virtual thread
+     * (see {@link #resolveStockOrSpace}). As of QuickShop-Hikari 6.3.0.0 the stock/space getters no
+     * longer assert they are off the main thread - {@code getRemainingStock()} performs its own
+     * region hop internally - but running off-region is still what we want, so that the search does
+     * not occupy a region thread for the duration.
+     * <p>
+     * Any failure for a single shop is logged and skipped rather than failing the whole search.
      */
-    private CompletableFuture<Boolean> permissionCheckFuture(Player searchingPlayer, Shop shopIterator) {
-        CompletableFuture<Boolean> permissionCheckFuture = new CompletableFuture<>();
-        FindItemAddOn.getScheduler().runAtEntity(searchingPlayer, (t) -> {
+    private CompletableFuture<Void> processShopMatchFuture(Predicate<Shop> itemFilter, boolean toBuy, Shop shopIterator,
+                                                             List<FoundShopItemModel> shopsFoundList, Player searchingPlayer) {
+        CompletableFuture<ItemStack> matchFuture = new CompletableFuture<>();
+        FindItemAddOn.getScheduler().runAtEntity(searchingPlayer, _ -> {
             try {
-                permissionCheckFuture.complete(shopIterator.playerAuthorize(searchingPlayer.getUniqueId(), BuiltInShopPermission.SEARCH));
+                boolean isMatch = shopIterator.playerAuthorize(searchingPlayer.getUniqueId(), BuiltInShopPermission.SEARCH)
+                        && !FindItemAddOn.getConfigProvider().getBlacklistedWorlds().contains(shopIterator.bukkitLocation().getWorld())
+                        && !HiddenShopStorageUtil.isShopHidden(shopIterator)
+                        && isWithinSearchDistance(shopIterator.bukkitLocation(), searchingPlayer.getLocation())
+                        && itemFilter.test(shopIterator)
+                        && !isShopInLockedBentoboxIsland(shopIterator, searchingPlayer);
+                matchFuture.complete(isMatch ? shopIterator.getItem() : null);
             } catch (Exception e) {
-                permissionCheckFuture.completeExceptionally(e);
+                matchFuture.completeExceptionally(e);
             }
         });
-        return permissionCheckFuture;
+        // If the player disconnects before the scheduler fires, the future would never
+        // complete and allOf().join() would block the virtual thread indefinitely.
+        return matchFuture.orTimeout(PERMISSION_CHECK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException) {
+                        Logger.logDebugInfo("Shop search processing timed out for player: " + searchingPlayer.getName());
+                    } else {
+                        Logger.logWarning("Skipping shop during search due to error (" + ex.getClass().getSimpleName() + "): " + ex.getMessage());
+                    }
+                    return null;
+                })
+                // Async, not just off the region thread for its own sake: QuickShop's
+                // queryShopInventoryCacheInDatabase() (used inside finalizeMatchedShop) asserts its
+                // caller is already off the main/region thread and throws otherwise.
+                .thenComposeAsync(matchedItem -> matchedItem != null
+                        ? finalizeMatchedShop(toBuy, shopIterator, matchedItem, shopsFoundList)
+                        : CompletableFuture.completedFuture(null), VirtualThreadScheduler.executor());
+    }
+
+    private boolean isWithinSearchDistance(Location shopLocation, Location playerLocation) {
+        int maxDistance = FindItemAddOn.getConfigProvider().SHOP_SEARCH_MAX_DISTANCE;
+        if (maxDistance <= 0) return true;
+        if (!shopLocation.getWorld().equals(playerLocation.getWorld())) return true;
+        return shopLocation.distanceSquared(playerLocation) <= (double) maxDistance * maxDistance;
+    }
+
+    /**
+     * Replaces {@code Shop#getPrice()}, deprecated for removal in QuickShop-Hikari 6.3.0.0.
+     * {@code Shop} became generic there but {@code ShopManager} still hands out raw {@code Shop},
+     * so {@code price()} erases to {@code Object} and needs the cast.
+     */
+    private static double getShopPrice(@NotNull Shop shop) {
+        return (Double) shop.price();
     }
 
     /**
@@ -209,7 +204,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
             return true;
         }
 
-        double price = shop.getPrice();
+        double price = getShopPrice(shop);
         double itemAmount = shop.getItem().getAmount();
         double pricePerTransaction = price * itemAmount;
 
@@ -293,7 +288,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
     @Override
     public boolean isShopOwnerCommandRunner(Player player, Shop shop) {
         Logger.logDebugInfo("Shop owner: " + shop.getOwner() + " | Player: " + player.getUniqueId());
-        return shop.getOwner().getUniqueId().toString().equalsIgnoreCase(player.getUniqueId().toString());
+        return shop.getOwner().getUniqueId().equals(player.getUniqueId());
     }
 
     @Override
@@ -308,7 +303,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
         // now check shops from temp globalShopsList in current globalShopsList and pull playerVisit data
         List<ShopSearchActivityModel> tempGlobalShopsList = new ArrayList<>();
         getAllShops().forEach(shopItem -> {
-            Location shopLoc = shopItem.getLocation();
+            Location shopLoc = shopItem.bukkitLocation();
             tempGlobalShopsList.add(new ShopSearchActivityModel(
                     shopLoc.getWorld().getName(),
                     shopLoc.getX(),
@@ -322,26 +317,28 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
             ));
         });
 
-        for (ShopSearchActivityModel shop_temp : tempGlobalShopsList) {
-            ShopSearchActivityModel tempShopToRemove = null;
-            for (ShopSearchActivityModel shop_global : globalShopsList) {
-                if (shop_global != null
-                        && shop_temp.getWorldName().equalsIgnoreCase(shop_global.getWorldName())
-                        && shop_temp.getX() == shop_global.getX()
-                        && shop_temp.getY() == shop_global.getY()
-                        && shop_temp.getZ() == shop_global.getZ()
-                        && shop_temp.getShopOwnerUUID().equalsIgnoreCase(shop_global.getShopOwnerUUID())) {
-                    shop_temp.setPlayerVisitList(shop_global.getPlayerVisitList());
-                    shop_temp.setHiddenFromSearch(shop_global.isHiddenFromSearch());
-                    tempShopToRemove = shop_global;
-                    break;
-                }
+        // Index the persisted shop list by location+owner key for O(1) lookup
+        Map<String, ShopSearchActivityModel> globalShopsMap = HashMap.newHashMap(globalShopsList.size());
+        for (ShopSearchActivityModel shop_global : globalShopsList) {
+            if (shop_global != null) {
+                globalShopsMap.put(shopKey(shop_global), shop_global);
             }
-            if (tempShopToRemove != null)
-                globalShopsList.remove(tempShopToRemove);
+        }
+        // For each live shop, pull saved visit/hidden state from the index if it exists.
+        // remove() is used so each persisted entry is consumed at most once.
+        for (ShopSearchActivityModel shopTemp : tempGlobalShopsList) {
+            ShopSearchActivityModel shopGlobal = globalShopsMap.remove(shopKey(shopTemp));
+            if (shopGlobal != null) {
+                shopTemp.setPlayerVisitList(shopGlobal.getPlayerVisitList());
+                shopTemp.setHiddenFromSearch(shopGlobal.isHiddenFromSearch());
+            }
         }
         Logger.logDebugInfo("Shops List sync complete. Time took: " + (System.currentTimeMillis() - start) + "ms.");
         return tempGlobalShopsList;
+    }
+
+    private static String shopKey(ShopSearchActivityModel shop) {
+        return shop.getWorldName().toLowerCase() + ":" + shop.getX() + ":" + shop.getY() + ":" + shop.getZ() + ":" + shop.getShopOwnerUUID().toLowerCase();
     }
 
     /**
@@ -415,11 +412,8 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
     }
 
     private int getRemainingStockOrSpaceFromShopCache(Shop shop, boolean fetchRemainingStock) {
-        String mainVersionStr = pluginVersion.split("\\.")[0];
-        int mainVersion = Integer.parseInt(mainVersionStr);
-        if (mainVersion >= 6) {
+        if (isQSHikariShopCacheImplemented) {
             // New feature available
-            Util.ensureThread(true);
             int stockOrSpace = (fetchRemainingStock ? shop.getRemainingStock() : shop.getRemainingSpace());
             Logger.logDebugInfo("Stock/Space from cache: " + stockOrSpace);
             return stockOrSpace;
@@ -448,33 +442,152 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
         return mainVersion >= 6;
     }
 
-    private void processPotentialShopMatchAndAddToFoundList(boolean toBuy, Shop shopIterator, List<FoundShopItemModel> shopsFoundList, Player searchingPlayer) {
-        Logger.logDebugInfo("Shop match found: " + shopIterator.getLocation());
-        // Check if shop is in a locked BentoBox island
+    private boolean isShopInLockedBentoboxIsland(Shop shop, Player searchingPlayer) {
         if (FindItemAddOn.getConfigProvider().BENTOBOX_IGNORE_LOCKED_ISLAND_SHOPS
                 && Objects.nonNull(FindItemAddOn.getBentoboxPlugin())
-                && FindItemAddOn.getBentoboxPlugin().isIslandLocked(shopIterator.getLocation(), searchingPlayer)) {
+                && FindItemAddOn.getBentoboxPlugin().isIslandLocked(shop.bukkitLocation(), searchingPlayer)) {
             Logger.logDebugInfo("Shop is in locked BentoBox island - ignoring");
-            return;
+            return true;
         }
-        // check for stock / space
-        int stockOrSpace = (toBuy ? getRemainingStockOrSpaceFromShopCache(shopIterator, true)
-                : getRemainingStockOrSpaceFromShopCache(shopIterator, false));
-        if(isShopToBeIgnoredForFullOrEmpty(stockOrSpace)) {
-            return;
+        return false;
+    }
+
+    /**
+     * Resolves a matched shop's stock/space, applies the empty/full and owner-balance filters, and
+     * appends it to the results.
+     * <p>
+     * The continuation is pinned to a virtual thread because the upstream stage completes on a
+     * QuickShop region or database thread, neither of which should run the economy lookup in
+     * {@link #isOwnerHavingEnoughBalance}. {@code matchedItem} is passed in rather than re-read via
+     * {@code shopIterator.getItem()}, which fires a {@code ShopItemEvent} and must stay on the
+     * region thread where the match was evaluated.
+     */
+    private CompletableFuture<Void> finalizeMatchedShop(boolean toBuy, Shop shopIterator, ItemStack matchedItem, List<FoundShopItemModel> shopsFoundList) {
+        Logger.logDebugInfo("Shop match found: " + shopIterator.bukkitLocation());
+        return resolveStockOrSpaceAsync(shopIterator, toBuy)
+                .thenAcceptAsync(stockOrSpace -> {
+                    if (isShopToBeIgnoredForFullOrEmpty(stockOrSpace)) {
+                        return;
+                    }
+                    // check if owner has enough balance for buying shops
+                    if (!toBuy && !isOwnerHavingEnoughBalance(shopIterator)) {
+                        Logger.logDebugInfo("Shop Owner is poor");
+                        return;
+                    }
+                    shopsFoundList.add(new FoundShopItemModel(
+                            getShopPrice(shopIterator),
+                            QSApi.processStockOrSpace(stockOrSpace),
+                            shopIterator.getOwner().getUniqueIdOptional().orElse(new UUID(0, 0)),
+                            shopIterator.bukkitLocation(),
+                            matchedItem,
+                            toBuy
+                    ));
+                }, VirtualThreadScheduler.executor())
+                .exceptionally(ex -> {
+                    Logger.logWarning("Skipping shop during search due to error ("
+                            + ex.getClass().getSimpleName() + "): " + ex.getMessage());
+                    return null;
+                });
+    }
+
+    /**
+     * Resolves a matched shop's stock (buying) or space (selling), preferring the cheapest source:
+     * unlimited shop, then a live read if the chunk is loaded, then QuickShop's persisted inventory
+     * count cache, and only then a chunk force-load (see issue #111). Never blocks.
+     * <p>
+     * Unlimited is checked first both because {@link QSApi#processStockOrSpace(int)} maps its
+     * {@code -1} to {@link Integer#MAX_VALUE} and because it removes the ambiguity in QuickShop's
+     * {@code -1} count-cache sentinel, which conflates "unlimited" with "never calculated".
+     */
+    private CompletableFuture<Integer> resolveStockOrSpaceAsync(Shop shop, boolean toBuy) {
+        if (shop.isUnlimited()) {
+            return CompletableFuture.completedFuture(-1);
         }
-        // check if owner has enough balance for buying shops
-        if(!toBuy && !isOwnerHavingEnoughBalance(shopIterator)) {
-            Logger.logDebugInfo("Shop Owner is poor");
-            return;
+        if (isShopChunkLoaded(shop)) {
+            // No getRemainingSpaceAsync() counterpart exists, so the sell path stays synchronous.
+            return toBuy
+                    ? shop.getRemainingStockAsync().orTimeout(STOCK_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                            .exceptionally(ex -> logAndDefault("Live stock read failed", shop, ex, 0))
+                    : VirtualThreadScheduler.supplyAsync(() -> getRemainingStockOrSpaceFromShopCache(shop, false));
         }
-        shopsFoundList.add(new FoundShopItemModel(
-                shopIterator.getPrice(),
-                QSApi.processStockOrSpace(stockOrSpace),
-                shopIterator.getOwner().getUniqueIdOptional().orElse(new UUID(0, 0)),
-                shopIterator.getLocation(),
-                shopIterator.getItem(),
-                toBuy
-        ));
+        return readStockOrSpaceFromQsCountCacheAsync(shop, toBuy)
+                .thenComposeAsync(cachedValue -> {
+                    if (cachedValue >= 0) {
+                        return CompletableFuture.completedFuture(cachedValue);
+                    }
+                    Logger.logDebugInfo("Falling back to chunk force-load for shop: " + shop.getShopId());
+                    return VirtualThreadScheduler.supplyAsync(
+                            () -> fetchLiveStockOrSpaceForUnloadedChunk(shop, toBuy));
+                }, VirtualThreadScheduler.executor());
+    }
+
+    /**
+     * Reads stock/space from QuickShop's persisted inventory count cache, which survives the chunk
+     * being unloaded.
+     * <p>
+     * Any negative result means "unusable, ask someone else". QuickShop documents {@code -1} as
+     * "never calculated or unlimited" and {@code -2} as "not cached yet", but a third case occurs
+     * in practice: {@code InternalListener#shopInventoryCalc} writes both stock and space on every
+     * {@code ShopInventoryCalculateEvent}, and {@code ContainerShop} fires that event with
+     * {@code -1} in whichever field it did not just compute - so a stock calculation clobbers the
+     * cached space and vice versa.
+     */
+    private CompletableFuture<Integer> readStockOrSpaceFromQsCountCacheAsync(Shop shop, boolean toBuy) {
+        return api.getShopManager()
+                .queryShopInventoryCacheInDatabase(shop)
+                .orTimeout(STOCK_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .thenApplyAsync(countCache -> {
+                    int cachedValue = (toBuy ? countCache.getStock() : countCache.getSpace());
+                    Logger.logDebugInfo("QS inventory count cache for shop " + shop.getShopId() + ": " + cachedValue);
+                    return cachedValue;
+                }, VirtualThreadScheduler.executor())
+                .exceptionally(ex -> logAndDefault("Failed to read QS inventory count cache", shop, ex, -2));
+    }
+
+    private static int logAndDefault(String what, Shop shop, Throwable ex, int fallback) {
+        Logger.logDebugInfo(what + " for shop " + shop.getShopId() + ": "
+                + ex.getClass().getSimpleName() + " - " + ex.getMessage());
+        return fallback;
+    }
+
+    private boolean isShopChunkLoaded(Shop shop) {
+        Location loc = shop.bukkitLocation();
+        var world = loc.getWorld();
+        return world != null && world.isChunkLoaded(loc.getBlockX() >> 4, loc.getBlockZ() >> 4);
+    }
+
+    /**
+     * Forces the shop's chunk to load on its owning region thread (Folia-safe via
+     * {@link com.tcoded.folialib.impl.PlatformScheduler#runAtLocation}), re-reads stock/space with
+     * the chunk actually present, then unloads the chunk again if this call is what loaded it.
+     */
+    private int fetchLiveStockOrSpaceForUnloadedChunk(Shop shop, boolean toBuy) {
+        Location loc = shop.bukkitLocation();
+        CompletableFuture<Integer> future = new CompletableFuture<>();
+        FindItemAddOn.getScheduler().runAtLocation(loc, _ -> {
+            try {
+                var world = loc.getWorld();
+                int chunkX = loc.getBlockX() >> 4;
+                int chunkZ = loc.getBlockZ() >> 4;
+                boolean wasLoaded = world != null && world.isChunkLoaded(chunkX, chunkZ);
+                if (!wasLoaded && world != null) {
+                    world.getChunkAt(chunkX, chunkZ);
+                }
+                int liveStockOrSpace = toBuy ? shop.getRemainingStock() : shop.getRemainingSpace();
+                if (!wasLoaded && world != null) {
+                    world.unloadChunk(chunkX, chunkZ, true);
+                }
+                future.complete(liveStockOrSpace);
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            }
+        });
+        return future.orTimeout(CHUNK_LOAD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    Logger.logDebugInfo("Failed to load chunk to verify live stock/space for shop at "
+                            + loc + ": " + ex.getClass().getSimpleName() + " - " + ex.getMessage());
+                    return 0;
+                })
+                .join();
     }
 }
