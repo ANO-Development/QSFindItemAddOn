@@ -226,6 +226,11 @@ public class FoundShopsMenu extends PaginatedMenu {
                 } else {
                     PlayerUtil.teleport(player, locToTeleport);
                 }
+            }).exceptionally(ex -> {
+                Logger.logWarning("Could not find a safe location near shop " + shopLocation + " for "
+                        + player.getName() + ": " + ex.getClass().getSimpleName() + " - " + ex.getMessage());
+                sendUnsafeAreaMessage(player);
+                return null;
             });
         });
     }

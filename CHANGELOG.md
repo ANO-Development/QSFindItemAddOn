@@ -1,3 +1,14 @@
+## Release 2.0.8.3
+
+### What's new for server owners
+- **Fixed clicking a shop in the search GUI sometimes doing nothing** — if none of the four blocks beside a shop held its sign (for example the sign sits on the other half of a double chest, or was removed), the safe-teleport lookup never finished, so there was no teleport and no message. The lookup now also checks the diagonal blocks, always finishes, and tells the player the area is unsafe if no spot is found.
+- **Fixed matching shops occasionally missing from results ("No shops found")** — when a stock/space read timed out or failed (busy server, many unloaded-chunk shops), the shop was counted as empty and dropped by `ignore-empty-chests: true`. Those shops are now kept and show their stock as `Unknown`.
+
+### Changes (technical)
+- `LocationUtils.findSafeLocationAroundShop`: candidate check extracted to `evaluateCandidate`; 8 candidates (orthogonal + diagonal), completes on first safe result or `null` after all are checked, per-candidate exceptions caught, 10s `orTimeout`
+- `FoundShopsMenu.handleDirectShopTeleport`: added `.exceptionally` that logs and sends the unsafe-area message
+- `QSHikariAPIHandler`: stock/space failure fallbacks return `UNKNOWN_STOCK_OR_SPACE` (-2) instead of `0`; `finalizeMatchedShop` no longer drops a shop when stock resolution throws
+
 ## Release 2.0.8.2
 
 ### What's new for server owners

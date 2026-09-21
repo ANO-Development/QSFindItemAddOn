@@ -75,6 +75,11 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
     private static final int CHUNK_LOAD_TIMEOUT_SECONDS = 5;
     /** Shared timeout for the stock/space reads in {@link #resolveStockOrSpaceAsync}. */
     private static final int STOCK_READ_TIMEOUT_SECONDS = 5;
+    /**
+     * Stock/space value for "could not be determined". Deliberately not 0: a failed read must not be
+     * mistaken for an empty shop and dropped by the ignore-empty-chests filter. The GUI renders it as "Unknown".
+     */
+    private static final int UNKNOWN_STOCK_OR_SPACE = -2;
     private final QuickShopAPI api;
     private final String pluginVersion;
     private final ConcurrentMap<Long, CachedShop> shopCache;
@@ -465,6 +470,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
     private CompletableFuture<Void> finalizeMatchedShop(boolean toBuy, Shop shopIterator, ItemStack matchedItem, List<FoundShopItemModel> shopsFoundList) {
         Logger.logDebugInfo("Shop match found: " + shopIterator.bukkitLocation());
         return resolveStockOrSpaceAsync(shopIterator, toBuy)
+                .exceptionally(ex -> logAndDefault("Stock/space resolution failed", shopIterator, ex, UNKNOWN_STOCK_OR_SPACE))
                 .thenAcceptAsync(stockOrSpace -> {
                     if (isShopToBeIgnoredForFullOrEmpty(stockOrSpace)) {
                         return;
@@ -507,7 +513,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
             // No getRemainingSpaceAsync() counterpart exists, so the sell path stays synchronous.
             return toBuy
                     ? shop.getRemainingStockAsync().orTimeout(STOCK_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                            .exceptionally(ex -> logAndDefault("Live stock read failed", shop, ex, 0))
+                            .exceptionally(ex -> logAndDefault("Live stock read failed", shop, ex, UNKNOWN_STOCK_OR_SPACE))
                     : VirtualThreadScheduler.supplyAsync(() -> getRemainingStockOrSpaceFromShopCache(shop, false));
         }
         return readStockOrSpaceFromQsCountCacheAsync(shop, toBuy)
@@ -541,7 +547,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
                     Logger.logDebugInfo("QS inventory count cache for shop " + shop.getShopId() + ": " + cachedValue);
                     return cachedValue;
                 }, VirtualThreadScheduler.executor())
-                .exceptionally(ex -> logAndDefault("Failed to read QS inventory count cache", shop, ex, -2));
+                .exceptionally(ex -> logAndDefault("Failed to read QS inventory count cache", shop, ex, UNKNOWN_STOCK_OR_SPACE));
     }
 
     private static int logAndDefault(String what, Shop shop, Throwable ex, int fallback) {
@@ -586,7 +592,7 @@ public class QSHikariAPIHandler implements QSApi<QuickShopAPI, Shop> {
                 .exceptionally(ex -> {
                     Logger.logDebugInfo("Failed to load chunk to verify live stock/space for shop at "
                             + loc + ": " + ex.getClass().getSimpleName() + " - " + ex.getMessage());
-                    return 0;
+                    return UNKNOWN_STOCK_OR_SPACE;
                 })
                 .join();
     }
